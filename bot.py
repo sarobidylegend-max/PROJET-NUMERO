@@ -1852,10 +1852,9 @@ async def cmd_rotateip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    import signal
-
     async def run():
-        # 1. Démarrer le serveur HTTP EN PREMIER (Railway health-check)
+        # 1. Démarrer le serveur webhook HTTP EN PREMIER (Railway health-check).
+        # aiohttp tourne dans CETTE même boucle asyncio — pas de conflit.
         runner = await wh.start_webhook_server()
 
         # 2. Construire l'application Telegram
@@ -1869,22 +1868,43 @@ def main():
 
         wh.set_bot_app(app)
 
-        # 3. post_init : lancer le price_watcher une fois le bot prêt
-        async def post_init(application):
-            asyncio.create_task(price_watcher(application))
-
-        app.post_init = post_init
-
         logger.info("🤖 Bot principal démarré — 🇫🇷 France & 🇺🇸 USA | Suivi prix actif")
 
-        # 4. run_polling gère initialize/start/stop/shutdown proprement
-        #    allowed_updates=[] = tous les updates
+        # 3. Initialiser manuellement dans la même boucle asyncio.
+        #    On N'utilise PAS app.run_polling() : il appelle loop.run_until_complete()
+        #    en interne, ce qui lève RuntimeError quand une boucle est déjà active.
+        await app.initialize()
+        await app.start()
+
+        # 4. Lancer le price_watcher
+        asyncio.create_task(price_watcher(app))
+
+        # 5. Polling Telegram (non-bloquant)
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        # 6. Attendre le signal d'arrêt
+        import signal as _signal
+        stop_event = asyncio.Event()
+
+        def _handle_signal():
+            stop_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _handle_signal)
+            except NotImplementedError:
+                pass  # Windows
+
         try:
-            await app.run_polling(
-                drop_pending_updates=True,
-                close_loop=False,
-            )
+            await stop_event.wait()
+        except (KeyboardInterrupt, SystemExit):
+            pass
         finally:
+            # 7. Arrêt propre
+            await app.updater.stop()
+            await app.stop()
+            await app.shutdown()
             await runner.cleanup()
 
     asyncio.run(run())
