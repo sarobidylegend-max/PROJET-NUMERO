@@ -1,0 +1,42 @@
+{
+  "agents": {
+    "6930107106": {
+      "uid": 6930107106,
+      "first_name": "Eurdogan",
+      "username": "eurdogan",
+      "total_achats": 2,
+      "total_declines": 0,
+      "last_number": "33609892629",
+      "last_activity": "03/05/2026 09:15",
+      "approved_at": "02/05/2026 16:28",
+      "restricted": false,
+      "restrict_reason": ""
+    },
+    "8242680466": {
+      "uid": 8242680466,
+      "first_name": "Tahiry",
+      "username": "Tahirysx",
+      "total_achats": 2,
+      "total_declines": 0,
+      "last_number": "19597632137",
+      "last_activity": "03/05/2026 08:46",
+      "approved_at": "02/05/2026 16:30",
+      "restricted": false,
+      "restrict_reason": ""
+    }
+  },
+  "sub_admins": {
+    "8466976555": {
+      "uid": 8466976555,
+      "first_name": "Genesis",
+      "username": "offishial237",
+      "promoted_at": "02/05/2026 17:14",
+      "total_achats": 2,
+      "total_declines": 0,
+      "last_number": "33667415604",
+      "last_activity": "03/05/2026 09:14"
+    }
+  },
+  "pending": {},
+  "banned": {}
+}
