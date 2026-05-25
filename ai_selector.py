@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # ── Clé API Anthropic ─────────────────────────────────────────────────────────
 # Variable d'environnement : ANTHROPIC_API_KEY
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "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")
 ANTHROPIC_URL     = "https://api.anthropic.com/v1/messages"
 AI_MODEL          = "claude-sonnet-4-20250514"
 
