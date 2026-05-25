@@ -1918,45 +1918,42 @@ async def cmd_rotateip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
-async def run():
-    """Point d'entrée async : démarre d'abord le serveur HTTP, puis le bot."""
-    # 1. Démarrer le serveur HTTP webhook EN PREMIER
-    #    Railway health-check valide le port avant d'accepter le déploiement
-    runner = await wh.start_webhook_server()
-
-    # 2. Construire l'application Telegram
-    app = Application.builder().token(Config.BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",   start))
-    app.add_handler(CommandHandler("veille",  cmd_veille))
-    app.add_handler(CommandHandler("agents",  cmd_agents))
-    app.add_handler(CommandHandler("restart", cmd_restart))
-    app.add_handler(CommandHandler("rotateip",cmd_rotateip))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    wh.set_bot_app(app)
-
-    # 3. Initialiser et démarrer le bot (polling)
-    await app.initialize()
-    await app.start()
-    asyncio.create_task(price_watcher(app))
-    logger.info("🤖 Bot principal démarré — 🇫🇷 France & 🇺🇸 USA | Suivi prix actif")
-
-    # 4. Boucle de polling (bloquante jusqu'à arrêt)
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    # Attendre indéfiniment
-    try:
-        await asyncio.Event().wait()
-    except (KeyboardInterrupt, SystemExit):
-        pass
-    finally:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        await runner.cleanup()
-
-
 def main():
+    import signal
+
+    async def run():
+        # 1. Démarrer le serveur HTTP EN PREMIER (Railway health-check)
+        runner = await wh.start_webhook_server()
+
+        # 2. Construire l'application Telegram
+        app = Application.builder().token(Config.BOT_TOKEN).build()
+        app.add_handler(CommandHandler("start",    start))
+        app.add_handler(CommandHandler("veille",   cmd_veille))
+        app.add_handler(CommandHandler("agents",   cmd_agents))
+        app.add_handler(CommandHandler("restart",  cmd_restart))
+        app.add_handler(CommandHandler("rotateip", cmd_rotateip))
+        app.add_handler(CallbackQueryHandler(button_handler))
+
+        wh.set_bot_app(app)
+
+        # 3. post_init : lancer le price_watcher une fois le bot prêt
+        async def post_init(application):
+            asyncio.create_task(price_watcher(application))
+
+        app.post_init = post_init
+
+        logger.info("🤖 Bot principal démarré — 🇫🇷 France & 🇺🇸 USA | Suivi prix actif")
+
+        # 4. run_polling gère initialize/start/stop/shutdown proprement
+        #    allowed_updates=[] = tous les updates
+        try:
+            await app.run_polling(
+                drop_pending_updates=True,
+                close_loop=False,
+            )
+        finally:
+            await runner.cleanup()
+
     asyncio.run(run())
 
 
