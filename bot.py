@@ -513,18 +513,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if   data == "capacite":          await handle_capacite(query, uid)
     elif data == "solde":             await handle_capacite(query, uid)
     # ── Agent ──
-    elif data == "choisir_prix":      await handle_choisir_prix(query, uid)
+    elif data == "choisir_prix":      await handle_choisir_prix(query, uid, context)
     elif data == "voir_otp":          await handle_voir_otp(query, uid, context)
     elif data == "nouveau_code":      await handle_nouveau_code(query, uid, context)
     elif data == "liberer_numero":    await handle_liberer(query, uid)
     elif data == "mon_historique":    await handle_mon_historique(query, uid)
     elif data == "renouveler_numero": await handle_renouveler(query, uid, context)
 
-    # ── Choix d'un prix spécifique ──
+    # ── Choix d'un prix (plus de menu manuel — auto-select depuis 0) ──
     elif data.startswith("pick_"):
-        parts = data.split("_")
-        idx = int(parts[1])
-        await handle_demander_numero(query, uid, context, price_index=idx)
+        await handle_demander_numero(query, uid, context, price_index=0)
 
     # ── Sous-admin ──
     elif data == "sub_acces"                         and um.is_sub_admin(uid): await handle_sub_acces(query)
@@ -656,16 +654,114 @@ async def handle_capacite(query, uid=None):
 async def handle_solde(query):
     await handle_capacite(query)
 
+# ─── Helper central : obtenir un numéro au meilleur prix + enregistrer webhook ──
+MAX_AUTO_PRICE = 0.10  # Seuil global : jamais plus de 0.10 $ par numéro
+
+async def _auto_get_number(country: str, uid: int, user_name: str, context) -> dict | None:
+    """
+    Obtient automatiquement le numéro le moins cher disponible sous MAX_AUTO_PRICE.
+    - Rafraîchit les prix en temps réel
+    - Filtre < MAX_AUTO_PRICE
+    - Tente du moins cher au plus cher jusqu'à succès
+    - Enregistre le callback webhook HeroSMS automatiquement
+    - Retourne le dict complet {number, rental_id, price, operator, country}
+      ou lève une Exception avec un message lisible si aucun numéro disponible.
+    """
+    prices = await get_prices_cached(country, force=True)
+    eligible = [p for p in prices if p["price"] < MAX_AUTO_PRICE]
+
+    if not eligible:
+        raise Exception(f"Aucune offre disponible sous {MAX_AUTO_PRICE:.2f} $")
+
+    balance = await sms_client.get_balance()
+    tried   = []
+
+    for candidate in eligible:
+        price_try = candidate["price"]
+        op_try    = candidate.get("operator", "any")
+
+        if balance < price_try:
+            tried.append(f"{op_try}@{price_try:.4f}$ (solde insuf.)")
+            continue
+
+        try:
+            result    = await sms_client.get_number(Config.SERVICE, country, op_try)
+            number    = result["number"]
+            rental_id = result["id"]
+
+            # ── Webhook callback : notifie l'agent dès réception du SMS ──────
+            async def _on_sms(sms_payload, _uid=uid, _app=context.application):
+                if _uid not in bot_state["active_numbers"]:
+                    return
+                d2 = bot_state["active_numbers"][_uid]
+                d2["webhook_sms"] = sms_payload
+                sms_code = sms_payload.get("code", "?")
+                sms_msg  = sms_payload.get("message", sms_code)
+                notif = (
+                    "\U0001f514 " + b("Code OTP recu en temps reel !") + "\n\n"
+                    "\U0001f511 Code : " + code(esc(str(sms_code))) + "\n"
+                    "\U0001f4e8 " + i(esc(str(sms_msg)))
+                )
+                try:
+                    await _app.bot.send_message(chat_id=_uid, text=notif, parse_mode="HTML")
+                except Exception as exc:
+                    logger.warning(f"[Webhook] notif uid={_uid}: {exc}")
+                # Mettre à jour le panneau inline si on a les identifiants
+                msg_id  = bot_state["panel_message_ids"].get(_uid)
+                chat_id = bot_state["panel_chat_ids"].get(_uid)
+                if msg_id and chat_id:
+                    rows = [
+                        [InlineKeyboardButton("\U0001f504 Rafraichir",   callback_data="voir_otp"),
+                         InlineKeyboardButton("\U0001f4e9 Nouveau code", callback_data="nouveau_code")],
+                        [InlineKeyboardButton("\U0001f501 Changer numero",  callback_data="renouveler_numero")],
+                        [InlineKeyboardButton("\U0001f51a Liberer le numero", callback_data="liberer_numero")],
+                        [InlineKeyboardButton("\U0001f519 Menu", callback_data="menu")],
+                    ]
+                    try:
+                        await _app.bot.edit_message_text(
+                            chat_id=chat_id, message_id=msg_id,
+                            text=notif + "\n\n" + i("Panneau mis a jour automatiquement."),
+                            parse_mode="HTML",
+                            reply_markup=InlineKeyboardMarkup(rows))
+                    except Exception:
+                        pass
+
+            wh.register_sms_callback(rental_id, _on_sms)
+
+            logger.info(f"[AutoSelect] ✅ uid={uid} op={op_try} prix={price_try:.4f}$ rental={rental_id}")
+            return {
+                "number":    number,
+                "rental_id": rental_id,
+                "price":     price_try,
+                "operator":  op_try,
+                "country":   country,
+            }
+
+        except Exception as err:
+            err_str = str(err)
+            tried.append(f"{op_try}@{price_try:.4f}$ ({err_str[:30]})")
+            logger.warning(f"[AutoSelect] op={op_try} prix={price_try} → {err_str}")
+
+    raise Exception(f"Aucun numéro disponible (essais: {', '.join(tried)})")
+
+
 # ─── Choisir parmi les prix ───────────────────────────────────────────────────
-async def handle_choisir_prix(query, uid):
-    kb_back  = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="menu")]])
+async def handle_choisir_prix(query, uid, context=None):
+    """Sélection entièrement automatique : le bot choisit le prix le plus bas < 0.10 $ sans menu."""
+    await handle_demander_numero(query, uid, context, price_index=0)
+
+
+# ─── Demander numéro avec prix choisi ─────────────────────────────────────────
+async def handle_demander_numero(query, uid, context, price_index: int = 0):
+    """Point d'entrée demande de numéro — utilise _auto_get_number."""
+    kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="menu")]])
     country  = get_user_country(uid)
     flag     = country_flag(country)
     label    = country_label(country)
 
     if not can_request(uid):
         info   = um.get_user_info(uid) or {}
-        reason = esc(info.get("restrict_reason",""))
+        reason = esc(info.get("restrict_reason", ""))
         await query.edit_message_text(
             f"⚠️ {b('Accès restreint')}\n\nVous ne pouvez pas demander de numéro.\n"
             f"{f'Raison : {i(reason)}' if reason else ''}",
@@ -683,181 +779,61 @@ async def handle_choisir_prix(query, uid):
         await query.edit_message_text("⏳ Votre demande est déjà en attente.", reply_markup=kb_back)
         return
 
-    await query.edit_message_text(f"⏳ Récupération des prix {flag} {label} en cours...", reply_markup=kb_back)
-    prices = await get_prices_cached(country, force=True)
+    await query.edit_message_text(f"⏳ Recherche du meilleur numéro {flag}…", reply_markup=kb_back)
+    user_name = query.from_user.first_name
 
-    if not prices:
+    try:
+        r = await _auto_get_number(country, uid, user_name, context)
+    except Exception as e:
         await query.edit_message_text(
-            f"⚠️ {b('Prix indisponibles')}\n\nImpossible de récupérer les tarifs HeroSMS pour {flag} {label}.\n"
-            f"Le numéro sera acheté au prix par défaut ({b(str(Config.PRICE_PER_NUMBER))} $).",
+            f"❌ {b('Aucun numéro disponible')}\n\n{esc(str(e))}\n\n💡 Réessayez dans quelques instants.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ Continuer au prix par défaut", callback_data="pick_0")],
-                [InlineKeyboardButton("🔙 Retour", callback_data="menu")],
+                [InlineKeyboardButton("🔄 Réessayer", callback_data="choisir_prix")],
+                [InlineKeyboardButton("🔙 Menu",      callback_data="menu")],
             ]))
-        bot_state["price_cache"][country] = [{"operator": "any", "price": Config.PRICE_PER_NUMBER, "count": 0}]
         return
 
-    medals  = ["🥇", "🥈", "🥉"]
-    last_up = bot_state["price_last_update"][country]
-    text    = (
-        f"{flag} {b(f'Choisissez votre offre {label}')}\n"
-        f"Service : {b(Config.SERVICE.upper())} | Pays : {label}\n"
-        f"🕐 Mis à jour : {last_up}\n\n"
+    number    = r["number"]
+    rental_id = r["rental_id"]
+    price     = r["price"]
+    operator  = r["operator"]
+
+    d = {
+        "number": number, "rental_id": rental_id, "user_name": user_name,
+        "price": price, "operator": operator, "country": country,
+        "accepted_at": now(), "requested_at": now(),
+    }
+    bot_state["active_numbers"][uid] = d
+    add_history(uid, user_name, number, rental_id, price, operator, country, "accepte")
+    um.increment_achats(uid, number)
+
+    start_number_timer(uid)
+    task = asyncio.create_task(number_expiry_task(uid, context.application))
+    bot_state["timer_tasks"][uid] = task
+
+    stats      = um.get_user_stats(uid)
+    admin_text = (
+        f"📡 {b('Numéro attribué en temps réel')}\n\n"
+        f"👤 {b(esc(user_name))} (ID: {code(str(uid))})\n"
+        f"{flag} Pays : {b(label)} | Numéro : {code(format_number(number, country))}\n"
+        f"💲 Prix : {b(f'{price:.4f}')} $ — opérateur {code(esc(operator))}\n"
+        f"🕐 {now()} | 📦 Total achats : {b(str(stats['total_achats']))}\n\n"
+        f"ℹ️ {i('Numéro actif. Suivre via Demandes actives.')}"
     )
-    balance = None
-    try:    balance = await sms_client.get_balance()
+    try:
+        await context.bot.send_message(
+            chat_id=Config.ADMIN_ID, text=admin_text, parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔚 Libérer pour l'agent", callback_data=f"admin_liberer_{uid}"),
+            ]]))
     except: pass
-
-    buttons = []
-    for idx, p in enumerate(prices):
-        op    = esc(p["operator"])
-        price = p["price"]
-        count = p["count"]
-        medal = medals[idx] if idx < 3 else "•"
-
-        if balance is not None and balance < price:
-            dispo = "🔴 Solde insuffisant"
-        else:
-            dispo = f"📦 {count} dispo" if count else "📦 Disponible"
-
-        text += (
-            f"{medal} {b(f'{price:.4f} $')} — opérateur {code(op)}\n"
-            f"   {dispo}\n\n"
-        )
-        label_btn = f"{medal} {price:.4f} $ — {count} dispo"
-        if balance is None or balance >= price:
-            buttons.append([InlineKeyboardButton(label_btn, callback_data=f"pick_{idx}")])
-        else:
-            buttons.append([InlineKeyboardButton(f"🔴 {price:.4f} $ (solde insuffisant)", callback_data="solde")])
-
-    buttons.append([
-        InlineKeyboardButton("🔄 Rafraîchir les prix", callback_data="choisir_prix"),
-        InlineKeyboardButton("🔙 Retour",              callback_data="menu"),
-    ])
-    await query.edit_message_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(buttons))
-
-# ─── Demander numéro avec prix choisi ─────────────────────────────────────────
-async def handle_demander_numero(query, uid, context, price_index: int = 0):
-    kb_back  = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Retour", callback_data="menu")]])
-    country  = get_user_country(uid)
-    prices   = bot_state["price_cache"][country]
-
-    if not prices or price_index >= len(prices):
-        await query.edit_message_text("⚠️ Prix non disponible. Réessayez.", reply_markup=kb_back)
-        return
-
-    chosen   = prices[price_index]
-    price    = chosen["price"]
-    operator = chosen.get("operator", "any")
-    flag     = country_flag(country)
-    label    = country_label(country)
-
-    try:
-        balance = await sms_client.get_balance()
-        if balance < price:
-            await query.edit_message_text(
-                f"🔴 {b('Solde insuffisant !')}\n\n"
-                f"Solde : {b(f'{balance:.4f}')} $ | Prix : {b(f'{price:.4f}')} $",
-                parse_mode="HTML", reply_markup=kb_back)
-            return
-    except Exception as e:
-        await query.edit_message_text(f"❌ Erreur vérification solde : {code(esc(str(e)))}", parse_mode="HTML", reply_markup=kb_back)
-        return
-
-    try:
-        result    = await sms_client.get_number(Config.SERVICE, country, operator)
-        number    = result["number"]
-        rental_id = result["id"]
-        user_name = query.from_user.first_name
-
-        d = {
-            "number": number, "rental_id": rental_id, "user_name": user_name,
-            "price": price, "operator": operator, "country": country,
-            "accepted_at": now(), "requested_at": now(),
-        }
-        bot_state["active_numbers"][uid] = d
-        add_history(uid, user_name, number, rental_id, price, operator, country, "accepte")
-        um.increment_achats(uid, number)
-
-        # ── Démarrer le compte à rebours 1h ──
-        start_number_timer(uid)
-        task = asyncio.create_task(number_expiry_task(uid, context.application))
-        bot_state["timer_tasks"][uid] = task
-
-        # ── Enregistrer le callback webhook SMS ──
-        async def _on_sms_webhook(sms_payload, _uid=uid, _app=context.application):
-            """Appelé instantanément par le webhook HeroSMS dès réception du SMS."""
-            if _uid not in bot_state["active_numbers"]:
-                return
-            d2 = bot_state["active_numbers"][_uid]
-            d2["webhook_sms"] = sms_payload
-            # Notifier l'agent immédiatement via Telegram
-            msg_id  = bot_state["panel_message_ids"].get(_uid)
-            chat_id = bot_state["panel_chat_ids"].get(_uid)
-            sms_code = sms_payload.get("code", "?")
-            sms_msg  = sms_payload.get("message", sms_code)
-            notif = (
-                "\U0001f514 " + b("Code OTP recu en temps reel !") + "\n\n"
-                "\U0001f511 Code : " + code(esc(str(sms_code))) + "\n"
-                "\U0001f4e8 " + i(esc(str(sms_msg)))
-            )
-            try:
-                await _app.bot.send_message(chat_id=_uid, text=notif, parse_mode="HTML")
-            except Exception as e:
-                logger.warning(f"Webhook notif failed for uid={_uid}: {e}")
-            # Mettre a jour le panneau actif
-            if msg_id and chat_id:
-                try:
-                    from bot import send_otp_panel
-                except Exception:
-                    pass
-                try:
-                    rows = [
-                        [InlineKeyboardButton("\U0001f504 Rafraichir", callback_data="voir_otp"),
-                         InlineKeyboardButton("\U0001f4e9 Nouveau code", callback_data="nouveau_code")],
-                        [InlineKeyboardButton("\U0001f501 Changer numero", callback_data="renouveler_numero")],
-                        [InlineKeyboardButton("\U0001f51a Liberer le numero", callback_data="liberer_numero")],
-                        [InlineKeyboardButton("\U0001f519 Menu", callback_data="menu")],
-                    ]
-                    await _app.bot.edit_message_text(
-                        chat_id=chat_id, message_id=msg_id,
-                        text=notif + "\n\n" + i("Panneau mis a jour automatiquement."),
-                        parse_mode="HTML",
-                        reply_markup=InlineKeyboardMarkup(rows))
-                except Exception:
-                    pass
-
-        wh.register_sms_callback(rental_id, _on_sms_webhook)
-
-        stats      = um.get_user_stats(uid)
-        admin_text = (
-            f"📡 {b('Numéro attribué en temps réel')}\n\n"
-            f"👤 {b(esc(user_name))} (ID: {code(str(uid))})\n"
-            f"{flag} Pays : {b(label)} | Numéro : {code(format_number(number, country))}\n"
-            f"💲 Prix : {b(f'{price:.4f}')} $ — opérateur {code(esc(operator))}\n"
-            f"🕐 {now()} | 📦 Total achats : {b(str(stats['total_achats']))}\n\n"
-            f"ℹ️ {i('Numéro actif. Vous pouvez suivre via Demandes actives.')}"
-        )
-        try:
-            await context.bot.send_message(
-                chat_id=Config.ADMIN_ID,
-                text=admin_text,
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("🔚 Libérer pour l'agent", callback_data=f"admin_liberer_{uid}"),
-                ]]))
+    sub_ids = um.get_sub_admin_ids() if hasattr(um, "get_sub_admin_ids") else []
+    for sub_id in sub_ids:
+        try: await context.bot.send_message(chat_id=sub_id, text=admin_text, parse_mode="HTML")
         except: pass
-        sub_ids = um.get_sub_admin_ids() if hasattr(um, "get_sub_admin_ids") else []
-        for sub_id in sub_ids:
-            try:
-                await context.bot.send_message(chat_id=sub_id, text=admin_text, parse_mode="HTML")
-            except: pass
 
-        await send_otp_panel(query, uid, context, edit=True)
-
-    except Exception as e:
-        await query.edit_message_text(f"❌ Erreur : {code(esc(str(e)))}", parse_mode="HTML", reply_markup=kb_back)
+    await send_otp_panel(query, uid, context, edit=True)
 
 
 async def send_otp_panel(query, uid, context, edit=False):
@@ -1009,6 +985,7 @@ async def handle_voir_otp(query, uid, context):
 
 # ─── Nouveau code ─────────────────────────────────────────────────────────────
 async def handle_nouveau_code(query, uid, context):
+    """Rachète un code supplémentaire sur le même numéro actif via auto-select + webhook."""
     kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu")]])
     if uid not in bot_state["active_numbers"]:
         await query.edit_message_text("⚠️ Aucun numéro actif.", reply_markup=kb_back)
@@ -1016,63 +993,43 @@ async def handle_nouveau_code(query, uid, context):
 
     d         = bot_state["active_numbers"][uid]
     old_num   = d["number"]
-    operator  = d.get("operator", "any")
-    price     = d.get("price", Config.PRICE_PER_NUMBER)
     user_name = d["user_name"]
     country   = d.get("country", COUNTRY_FR)
 
-    try:
-        balance = await sms_client.get_balance()
-        if balance < price:
-            await query.edit_message_text(
-                f"🔴 {b('Solde insuffisant pour racheter un code !')}\n\n"
-                f"Solde : {b(f'{balance:.4f}')} $ | Prix : {b(f'{price:.4f}')} $",
-                parse_mode="HTML", reply_markup=kb_back)
-            return
-    except Exception as e:
-        await query.edit_message_text(f"❌ Erreur vérification solde : {code(esc(str(e)))}", parse_mode="HTML", reply_markup=kb_back)
-        return
+    await query.edit_message_text(f"🔄 Rachat d'un nouveau code pour {code(esc(old_num))}…", parse_mode="HTML")
 
-    await query.edit_message_text(
-        f"🔄 Rachat d'un nouveau code pour {code(esc(old_num))}...", parse_mode="HTML")
+    # Annuler l'ancien rental et désenregistrer son webhook
+    old_rental_id = d["rental_id"]
+    wh.unregister_sms_callback(old_rental_id)
+    try: await sms_client.cancel_number(old_rental_id)
+    except: pass
 
     try:
-        old_rental_id = d["rental_id"]
-        wh.unregister_sms_callback(old_rental_id)  # nouveau code
-        try: await sms_client.cancel_number(old_rental_id)
-        except: pass
-
-        result     = await sms_client.get_number(Config.SERVICE, country, operator)
-        new_number = result["number"]
-        rental_id  = result["id"]
-
-        new_d = {
-            "number":       new_number,
-            "rental_id":    rental_id,
-            "user_name":    user_name,
-            "price":        price,
-            "operator":     operator,
-            "country":      country,
-            "accepted_at":  now(),
-            "requested_at": now(),
-        }
-        bot_state["active_numbers"][uid] = new_d
-        add_history(uid, user_name, new_number, rental_id, price, operator, country, "accepte")
-        um.increment_achats(uid, new_number)
-
-        # ── Redémarrer le compte à rebours ──
-        start_number_timer(uid)
-        task = asyncio.create_task(number_expiry_task(uid, context.application))
-        bot_state["timer_tasks"][uid] = task
-
-        await send_otp_panel(query, uid, context, edit=True)
-
+        r = await _auto_get_number(country, uid, user_name, context)
     except Exception as e:
         await query.edit_message_text(
-            f"❌ Erreur rachat code : {code(esc(str(e)))}", parse_mode="HTML", reply_markup=kb_back)
+            f"❌ Erreur rachat code : {esc(str(e))}", parse_mode="HTML", reply_markup=kb_back)
+        return
+
+    new_d = {
+        "number":    r["number"],   "rental_id": r["rental_id"],
+        "user_name": user_name,     "price":     r["price"],
+        "operator":  r["operator"], "country":   country,
+        "accepted_at": now(), "requested_at": now(),
+    }
+    bot_state["active_numbers"][uid] = new_d
+    add_history(uid, user_name, r["number"], r["rental_id"], r["price"], r["operator"], country, "accepte")
+    um.increment_achats(uid, r["number"])
+
+    start_number_timer(uid)
+    task = asyncio.create_task(number_expiry_task(uid, context.application))
+    bot_state["timer_tasks"][uid] = task
+
+    await send_otp_panel(query, uid, context, edit=True)
 
 # ─── Racheter un numéro depuis l'historique ───────────────────────────────────
 async def handle_racheter(query, requester_uid, target_uid, number, operator, context):
+    """Rachète un numéro depuis l'historique via auto-select + webhook."""
     back_cb = "admin_historique" if is_admin(requester_uid) else "mon_historique"
     kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Historique", callback_data=back_cb)]])
 
@@ -1085,73 +1042,51 @@ async def handle_racheter(query, requester_uid, target_uid, number, operator, co
             parse_mode="HTML", reply_markup=kb_back)
         return
 
-    # Déterminer le pays depuis l'historique
-    country = COUNTRY_FR
+    country   = COUNTRY_FR
     for e in reversed(bot_state["history"]):
         if e["uid"] == target_uid and e["number"][-len(number):] == number:
             country = e.get("country", COUNTRY_FR)
             break
 
-    prices = await get_prices_cached(country)
-    price  = prices[0]["price"] if prices else Config.PRICE_PER_NUMBER
+    info      = um.get_user_info(target_uid) or {}
+    user_name = info.get("first_name", f"Agent {target_uid}")
+
+    await query.edit_message_text(f"🔄 Rachat du numéro {code(esc(number))} en cours…", parse_mode="HTML")
 
     try:
-        balance = await sms_client.get_balance()
-        if balance < price:
-            await query.edit_message_text(
-                f"🔴 {b('Solde insuffisant !')}\n\n"
-                f"Solde : {b(f'{balance:.4f}')} $ | Prix : {b(f'{price:.4f}')} $",
-                parse_mode="HTML", reply_markup=kb_back)
-            return
-    except Exception as e:
-        await query.edit_message_text(f"❌ Erreur solde : {code(esc(str(e)))}", parse_mode="HTML", reply_markup=kb_back)
-        return
-
-    await query.edit_message_text(f"🔄 Rachat du numéro {code(esc(number))} en cours...", parse_mode="HTML")
-
-    try:
-        result     = await sms_client.get_number(Config.SERVICE, country, operator)
-        new_number = result["number"]
-        rental_id  = result["id"]
-
-        info      = um.get_user_info(target_uid) or {}
-        user_name = info.get("first_name", f"Agent {target_uid}")
-
-        d = {
-            "number":       new_number,
-            "rental_id":    rental_id,
-            "user_name":    user_name,
-            "price":        price,
-            "operator":     operator,
-            "country":      country,
-            "accepted_at":  now(),
-            "requested_at": now(),
-        }
-        bot_state["active_numbers"][target_uid] = d
-        add_history(target_uid, user_name, new_number, rental_id, price, operator, country, "accepte")
-        um.increment_achats(target_uid, new_number)
-
-        same = "✅ Même numéro récupéré !" if new_number == number else f"ℹ️ Numéro attribué : {code(esc(new_number))}"
-        flag = country_flag(country)
-
-        if requester_uid == target_uid:
-            await send_otp_panel(query, target_uid, context, edit=True)
-        else:
-            await query.edit_message_text(
-                f"🔁 {b('Rachat effectué')}\n\n"
-                f"👤 Agent : {b(esc(user_name))}\n"
-                f"{flag} {same}\n"
-                f"💲 Prix : {b(f'{price:.4f}')} $\n"
-                f"🕐 {now()}",
-                parse_mode="HTML", reply_markup=kb_back)
-            try:
-                await send_otp_panel(query, target_uid, context, edit=False)
-            except: pass
-
+        r = await _auto_get_number(country, target_uid, user_name, context)
     except Exception as e:
         await query.edit_message_text(
-            f"❌ Erreur rachat : {code(esc(str(e)))}", parse_mode="HTML", reply_markup=kb_back)
+            f"❌ Erreur rachat : {esc(str(e))}", parse_mode="HTML", reply_markup=kb_back)
+        return
 
+    d = {
+        "number":    r["number"],   "rental_id": r["rental_id"],
+        "user_name": user_name,     "price":     r["price"],
+        "operator":  r["operator"], "country":   country,
+        "accepted_at": now(), "requested_at": now(),
+    }
+    bot_state["active_numbers"][target_uid] = d
+    add_history(target_uid, user_name, r["number"], r["rental_id"], r["price"], r["operator"], country, "accepte")
+    um.increment_achats(target_uid, r["number"])
+
+    start_number_timer(target_uid)
+    task = asyncio.create_task(number_expiry_task(target_uid, context.application))
+    bot_state["timer_tasks"][target_uid] = task
+
+    flag = country_flag(country)
+    same = "✅ Même numéro récupéré !" if r["number"] == number else f"ℹ️ Numéro : {code(esc(r['number']))}"
+
+    if requester_uid == target_uid:
+        await send_otp_panel(query, target_uid, context, edit=True)
+    else:
+        await query.edit_message_text(
+            f"🔁 {b('Rachat effectué')}\n\n"
+            f"👤 Agent : {b(esc(user_name))}\n"
+            f"{flag} {same}\n💲 {b(f'{r['price']:.4f} $')}\n🕐 {now()}",
+            parse_mode="HTML", reply_markup=kb_back)
+        try: await send_otp_panel(query, target_uid, context, edit=False)
+        except: pass
 # ─── Libérer numéro ───────────────────────────────────────────────────────────
 async def handle_liberer(query, uid):
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu")]])
@@ -1192,18 +1127,17 @@ async def handle_liberer(query, uid):
 
 # ─── Renouveler numéro ────────────────────────────────────────────────────────
 async def handle_renouveler(query, uid, context):
+    """Change le numéro actif par un nouveau via auto-select + webhook."""
     kb_back = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu")]])
     if uid not in bot_state["active_numbers"]:
         await query.edit_message_text("⚠️ Pas de numéro actif à renouveler.", reply_markup=kb_back)
         return
 
-    # ── Vérification du délai de 120 secondes ──
     lockout = get_lockout_remaining(uid)
     if lockout > 0:
         await query.edit_message_text(
             f"🔒 {b('Renouvellement temporairement bloqué')}\n\n"
-            f"Pour éviter les erreurs, vous devez attendre {b(format_countdown(lockout))} avant de changer de numéro.\n\n"
-            f"⏳ Rafraîchissez votre panneau dans quelques secondes.",
+            f"Attendez {b(format_countdown(lockout))} avant de changer de numéro.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Rafraîchir", callback_data="voir_otp")],
@@ -1211,40 +1145,39 @@ async def handle_renouveler(query, uid, context):
             ]))
         return
 
-    d            = bot_state["active_numbers"].pop(uid)
-    old_price    = d.get("price", Config.PRICE_PER_NUMBER)
-    old_operator = d.get("operator", "any")
-    country      = d.get("country", COUNTRY_FR)
+    d         = bot_state["active_numbers"].pop(uid)
+    country   = d.get("country", COUNTRY_FR)
+    user_name = d["user_name"]
     clear_number_timer(uid)
-    add_history(uid, d["user_name"], d["number"], d["rental_id"], d["price"], d["operator"], country, "libere")
-    wh.unregister_sms_callback(d["rental_id"])  # renouvellement
+    add_history(uid, user_name, d["number"], d["rental_id"], d["price"], d["operator"], country, "libere")
+    wh.unregister_sms_callback(d["rental_id"])
     try: await sms_client.cancel_number(d["rental_id"])
     except Exception as e: logger.warning(f"Annulation renouvellement: {e}")
 
+    await query.edit_message_text(f"⏳ Recherche d'un nouveau numéro…", reply_markup=kb_back)
+
     try:
-        result    = await sms_client.get_number(Config.SERVICE, country, old_operator)
-        number    = result["number"]
-        rental_id = result["id"]
-        user_name = d["user_name"]
-
-        new_d = {
-            "number": number, "rental_id": rental_id, "user_name": user_name,
-            "price": old_price, "operator": old_operator, "country": country,
-            "accepted_at": now(), "requested_at": now(),
-        }
-        bot_state["active_numbers"][uid] = new_d
-        add_history(uid, user_name, number, rental_id, old_price, old_operator, country, "accepte")
-        um.increment_achats(uid, number)
-
-        # ── Redémarrer le compte à rebours ──
-        start_number_timer(uid)
-        task = asyncio.create_task(number_expiry_task(uid, context.application))
-        bot_state["timer_tasks"][uid] = task
-
-        await send_otp_panel(query, uid, context, edit=True)
+        r = await _auto_get_number(country, uid, user_name, context)
     except Exception as e:
-        await query.edit_message_text(f"❌ Erreur renouvellement : {code(esc(str(e)))}", parse_mode="HTML", reply_markup=kb_back)
+        await query.edit_message_text(
+            f"❌ Erreur renouvellement : {esc(str(e))}", parse_mode="HTML", reply_markup=kb_back)
+        return
 
+    new_d = {
+        "number":    r["number"],   "rental_id": r["rental_id"],
+        "user_name": user_name,     "price":     r["price"],
+        "operator":  r["operator"], "country":   country,
+        "accepted_at": now(), "requested_at": now(),
+    }
+    bot_state["active_numbers"][uid] = new_d
+    add_history(uid, user_name, r["number"], r["rental_id"], r["price"], r["operator"], country, "accepte")
+    um.increment_achats(uid, r["number"])
+
+    start_number_timer(uid)
+    task = asyncio.create_task(number_expiry_task(uid, context.application))
+    bot_state["timer_tasks"][uid] = task
+
+    await send_otp_panel(query, uid, context, edit=True)
 # ─── Historique personnel ─────────────────────────────────────────────────────
 async def handle_mon_historique(query, uid):
     mes   = [e for e in bot_state["history"] if e["uid"] == uid]
@@ -1919,6 +1852,8 @@ async def cmd_rotateip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
+    import signal
+
     async def run():
         # 1. Démarrer le serveur HTTP EN PREMIER (Railway health-check)
         runner = await wh.start_webhook_server()
@@ -1934,40 +1869,24 @@ def main():
 
         wh.set_bot_app(app)
 
+        # 3. post_init : lancer le price_watcher une fois le bot prêt
+        async def post_init(application):
+            asyncio.create_task(price_watcher(application))
+
+        app.post_init = post_init
+
         logger.info("🤖 Bot principal démarré — 🇫🇷 France & 🇺🇸 USA | Suivi prix actif")
 
-        # 3. Initialiser manuellement
-        await app.initialize()
-        await app.start()
+        # 4. run_polling gère initialize/start/stop/shutdown proprement
+        #    allowed_updates=[] = tous les updates
+        try:
+            await app.run_polling(
+                drop_pending_updates=True,
+                close_loop=False,
+            )
+        finally:
+            await runner.cleanup()
 
-        # 4. Lancer price_watcher
-        asyncio.create_task(price_watcher(app))
-
-        # 5. Démarrer le polling
-        await app.updater.start_polling(drop_pending_updates=True)
-
-        # 6. Attendre jusqu'à signal d'arrêt
-        stop_event = asyncio.Event()
-
-        def _signal_handler():
-            stop_event.set()
-
-        loop = asyncio.get_running_loop()
-        for sig in (signal.SIGINT, signal.SIGTERM):
-            try:
-                loop.add_signal_handler(sig, _signal_handler)
-            except NotImplementedError:
-                pass
-
-        await stop_event.wait()
-
-        # 7. Arrêt propre
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
-        await runner.cleanup()
-
-    import signal
     asyncio.run(run())
 
 
