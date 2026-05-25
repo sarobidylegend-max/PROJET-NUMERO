@@ -659,19 +659,21 @@ MAX_AUTO_PRICE = 0.10  # Seuil global : jamais plus de 0.10 $ par numéro
 
 async def _auto_get_number(country: str, uid: int, user_name: str, context) -> dict | None:
     """
-    Obtient automatiquement le numéro le moins cher disponible sous MAX_AUTO_PRICE.
+    Obtient automatiquement le numéro le moins cher disponible à MAX_AUTO_PRICE ou moins.
     - Rafraîchit les prix en temps réel
-    - Filtre < MAX_AUTO_PRICE
+    - Filtre <= MAX_AUTO_PRICE (inclut exactement 0.10 $)
     - Tente du moins cher au plus cher jusqu'à succès
+    - Si tous les opérateurs échouent, tente avec operator='any' en dernier recours
     - Enregistre le callback webhook HeroSMS automatiquement
     - Retourne le dict complet {number, rental_id, price, operator, country}
       ou lève une Exception avec un message lisible si aucun numéro disponible.
     """
     prices = await get_prices_cached(country, force=True)
-    eligible = [p for p in prices if p["price"] < MAX_AUTO_PRICE]
+    eligible = [p for p in prices if p["price"] <= MAX_AUTO_PRICE]
 
     if not eligible:
-        raise Exception(f"Aucune offre disponible sous {MAX_AUTO_PRICE:.2f} $")
+        # Dernier recours : tenter avec operator='any' sans filtrage prix
+        eligible = [{"operator": "any", "price": MAX_AUTO_PRICE, "count": 1}]
 
     balance = await sms_client.get_balance()
     tried   = []
@@ -697,6 +699,12 @@ async def _auto_get_number(country: str, uid: int, user_name: str, context) -> d
                 d2["webhook_sms"] = sms_payload
                 sms_code = sms_payload.get("code", "?")
                 sms_msg  = sms_payload.get("message", sms_code)
+                # Stocker le code dans l'historique pour l'admin
+                for e in bot_state["history"]:
+                    if e["rental_id"] == d2.get("rental_id"):
+                        e["otp_code"] = str(sms_code)
+                        e["otp_msg"]  = str(sms_msg)
+                        break
                 notif = (
                     "\U0001f514 " + b("Code OTP recu en temps reel !") + "\n\n"
                     "\U0001f511 Code : " + code(esc(str(sms_code))) + "\n"
@@ -785,8 +793,14 @@ async def handle_demander_numero(query, uid, context, price_index: int = 0):
     try:
         r = await _auto_get_number(country, uid, user_name, context)
     except Exception as e:
+        err_msg = str(e).lower()
+        # Message propre selon le type d'erreur — sans détails techniques
+        if "solde" in err_msg or "balance" in err_msg or "insuf" in err_msg:
+            user_msg = "💳 Solde insuffisant sur le compte HeroSMS."
+        else:
+            user_msg = f"📵 Aucun numéro {flag} disponible pour le moment."
         await query.edit_message_text(
-            f"❌ {b('Aucun numéro disponible')}\n\n{esc(str(e))}\n\n💡 Réessayez dans quelques instants.",
+            f"❌ {b('Numéro indisponible')}\n\n{user_msg}\n\n💡 Réessayez dans quelques instants ou changez de pays.",
             parse_mode="HTML",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔄 Réessayer", callback_data="choisir_prix")],
@@ -1008,7 +1022,8 @@ async def handle_nouveau_code(query, uid, context):
         r = await _auto_get_number(country, uid, user_name, context)
     except Exception as e:
         await query.edit_message_text(
-            f"❌ Erreur rachat code : {esc(str(e))}", parse_mode="HTML", reply_markup=kb_back)
+            f"❌ Impossible d'obtenir un nouveau code pour le moment.\n\n💡 Réessayez dans quelques instants.",
+            parse_mode="HTML", reply_markup=kb_back)
         return
 
     new_d = {
@@ -1200,6 +1215,9 @@ async def handle_mon_historique(query, uid):
             text += f"│  🕐 {e['requested_at']}\n"
             if e["accepted_at"]: text += f"│  ✅ {e['accepted_at']}\n"
             if e["ended_at"]:    text += f"│  🔚 {e['ended_at']}\n"
+            # Afficher le code OTP reçu si disponible
+            if e.get("otp_code"):
+                text += f"│  🔑 Code reçu : {code(esc(e['otp_code']))}\n"
             text += "│\n"
 
             if e["status"] in ("libere", "decline") and num not in seen:
@@ -1256,6 +1274,15 @@ async def handle_admin_historique(query):
         aid = e["uid"]
         by_agent.setdefault(aid, []).append(e)
 
+    # ── Comptes VA nécessitant intervention (libérés sans code reçu) ───────────
+    va_alerte = [e for e in h if e["status"] == "libere" and not e.get("otp_code")]
+    if va_alerte:
+        text += f"⚠️ {b('Comptes VA à vérifier')} ({len(va_alerte)}) — numéros libérés sans code\n"
+        for e in va_alerte[-5:]:
+            c_flag = country_flag(e.get("country", COUNTRY_FR))
+            text += f"   🔴 {b(esc(e['user_name']))} — {c_flag} {code(format_number(e['number'], e.get('country', COUNTRY_FR)))} libéré {e.get('ended_at','')}\n"
+        text += "\n"
+
     buttons = []
     for aid, entries in by_agent.items():
         last10     = list(reversed(entries[-10:]))
@@ -1268,18 +1295,21 @@ async def handle_admin_historique(query):
             num       = e["number"]
             c_flag    = country_flag(e.get("country", COUNTRY_FR))
             price_str = f" {e.get('price',0):.4f}$" if e.get("price") else ""
-            text += f"   ├ {c_flag} {code(format_number(num, e.get('country', COUNTRY_FR)))} {slabel(e['status'])}{price_str} — {e['requested_at']}\n"
+            # Indicateur d'alerte si libéré sans code reçu
+            alerte_va = " 🔴" if e["status"] == "libere" and not e.get("otp_code") else ""
+            otp_str   = f" | 🔑 {code(esc(e['otp_code']))}" if e.get("otp_code") else ""
+            text += f"   ├ {c_flag} {code(format_number(num, e.get('country', COUNTRY_FR)))} {slabel(e['status'])}{price_str}{otp_str}{alerte_va} — {e['requested_at']}\n"
 
             if e["status"] in ("libere", "decline") and num not in seen_nums:
                 seen_nums.add(num)
                 op     = e.get("operator", "any")
                 num_cb = num[-15:]
-                lbl    = f"🔁 Racheter {num[-6:]} → {agent_name}"
-                cb     = f"racheter_{aid}_{num_cb}_{op}"
                 if has_active:
                     lbl = f"⛔ {agent_name} a déjà un numéro actif"
                     buttons.append([InlineKeyboardButton(lbl, callback_data=f"numno_{aid}")])
                 else:
+                    lbl = f"🔁 Racheter {num[-6:]} → {agent_name}"
+                    cb  = f"racheter_{aid}_{num_cb}_{op}"
                     buttons.append([InlineKeyboardButton(lbl, callback_data=cb)])
 
         text += "\n"
