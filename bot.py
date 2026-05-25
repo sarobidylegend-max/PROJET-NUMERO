@@ -5,12 +5,15 @@ Bot Telegram — Numéros virtuels HeroSMS
 
 import logging
 import asyncio
+import os
+import sys
 from datetime import datetime, timedelta
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 from herosms_api import HeroSMSClient
 from config import Config
 import user_manager as um
+import webhook_server as wh
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -249,6 +252,7 @@ async def number_expiry_task(uid: int, app):
         clear_number_timer(uid)
         add_history(uid, d["user_name"], d["number"], d["rental_id"],
                     d["price"], d["operator"], country, "libere")
+        wh.unregister_sms_callback(d["rental_id"])  # expiry
         try: await sms_client.cancel_number(d["rental_id"])
         except Exception as e: logger.warning(f"Annulation HeroSMS (expiry): {e}")
 
@@ -429,6 +433,7 @@ def build_main_keyboard(uid):
             InlineKeyboardButton("📊 Historique global",     callback_data="admin_historique"),
         ])
         buttons.append([InlineKeyboardButton("👥 Gérer accès agents", callback_data="sub_acces")])
+        buttons.append([InlineKeyboardButton("⚙️ Système & Outils",   callback_data="admin_systeme")])
 
     if is_main_admin(uid):
         label_veille = "☀️ Désactiver veille" if bot_state["veille"] else "🌙 Activer veille"
@@ -445,6 +450,7 @@ def build_main_keyboard(uid):
             InlineKeyboardButton("🛡️ Gérer les admins",     callback_data="admin_admins"),
             InlineKeyboardButton("💳 Recharger le compte",   callback_data="admin_recharge"),
         ])
+        buttons.append([InlineKeyboardButton("⚙️ Système & Outils",   callback_data="admin_systeme")])
     return InlineKeyboardMarkup(buttons)
 
 # ─── /start ───────────────────────────────────────────────────────────────────
@@ -540,6 +546,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_prix"       and is_main_admin(uid):  await handle_admin_prix(query)
     elif data == "admin_admins"     and is_main_admin(uid):  await handle_admin_admins(query)
     elif data == "admin_recharge"   and is_main_admin(uid):  await handle_admin_recharge(query)
+
+    # ── Système & Outils (admin + sous-admin) ──
+    elif data == "admin_systeme"          and is_admin(uid): await handle_admin_systeme(query, uid)
+    elif data == "sys_reload_proxy"       and is_admin(uid): await handle_sys_reload_proxy(query, uid)
+    elif data == "sys_test_conn"          and is_admin(uid): await handle_sys_test_conn(query, uid)
+    elif data == "sys_restart_confirm"    and is_admin(uid): await handle_sys_restart_confirm(query, uid)
+    elif data == "sys_restart_do"         and is_admin(uid): await handle_sys_restart_do(query, uid, context)
 
     elif data.startswith("numok_")  and is_admin(uid): await handle_accept(query, int(data.split("_")[1]), context)
     elif data.startswith("numno_")  and is_admin(uid): await handle_decline(query, int(data.split("_")[1]), context)
@@ -772,6 +785,51 @@ async def handle_demander_numero(query, uid, context, price_index: int = 0):
         task = asyncio.create_task(number_expiry_task(uid, context.application))
         bot_state["timer_tasks"][uid] = task
 
+        # ── Enregistrer le callback webhook SMS ──
+        async def _on_sms_webhook(sms_payload, _uid=uid, _app=context.application):
+            """Appelé instantanément par le webhook HeroSMS dès réception du SMS."""
+            if _uid not in bot_state["active_numbers"]:
+                return
+            d2 = bot_state["active_numbers"][_uid]
+            d2["webhook_sms"] = sms_payload
+            # Notifier l'agent immédiatement via Telegram
+            msg_id  = bot_state["panel_message_ids"].get(_uid)
+            chat_id = bot_state["panel_chat_ids"].get(_uid)
+            sms_code = sms_payload.get("code", "?")
+            sms_msg  = sms_payload.get("message", sms_code)
+            notif = (
+                "\U0001f514 " + b("Code OTP recu en temps reel !") + "\n\n"
+                "\U0001f511 Code : " + code(esc(str(sms_code))) + "\n"
+                "\U0001f4e8 " + i(esc(str(sms_msg)))
+            )
+            try:
+                await _app.bot.send_message(chat_id=_uid, text=notif, parse_mode="HTML")
+            except Exception as e:
+                logger.warning(f"Webhook notif failed for uid={_uid}: {e}")
+            # Mettre a jour le panneau actif
+            if msg_id and chat_id:
+                try:
+                    from bot import send_otp_panel
+                except Exception:
+                    pass
+                try:
+                    rows = [
+                        [InlineKeyboardButton("\U0001f504 Rafraichir", callback_data="voir_otp"),
+                         InlineKeyboardButton("\U0001f4e9 Nouveau code", callback_data="nouveau_code")],
+                        [InlineKeyboardButton("\U0001f501 Changer numero", callback_data="renouveler_numero")],
+                        [InlineKeyboardButton("\U0001f51a Liberer le numero", callback_data="liberer_numero")],
+                        [InlineKeyboardButton("\U0001f519 Menu", callback_data="menu")],
+                    ]
+                    await _app.bot.edit_message_text(
+                        chat_id=chat_id, message_id=msg_id,
+                        text=notif + "\n\n" + i("Panneau mis a jour automatiquement."),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup(rows))
+                except Exception:
+                    pass
+
+        wh.register_sms_callback(rental_id, _on_sms_webhook)
+
         stats      = um.get_user_stats(uid)
         admin_text = (
             f"📡 {b('Numéro attribué en temps réel')}\n\n"
@@ -934,6 +992,7 @@ async def handle_decline(query, target_uid, context):
     flag    = country_flag(country)
     clear_number_timer(target_uid)
     add_history(target_uid, d["user_name"], d["number"], d["rental_id"], d["price"], d["operator"], country, "libere")
+    wh.unregister_sms_callback(d["rental_id"])
     try: await sms_client.cancel_number(d["rental_id"])
     except Exception as e: logger.warning(f"Annulation HeroSMS: {e}")
     await context.bot.send_message(
@@ -979,6 +1038,7 @@ async def handle_nouveau_code(query, uid, context):
 
     try:
         old_rental_id = d["rental_id"]
+        wh.unregister_sms_callback(old_rental_id)  # nouveau code
         try: await sms_client.cancel_number(old_rental_id)
         except: pass
 
@@ -1118,6 +1178,7 @@ async def handle_liberer(query, uid):
     flag    = country_flag(country)
     clear_number_timer(uid)
     add_history(uid, d["user_name"], d["number"], d["rental_id"], d["price"], d["operator"], country, "libere")
+    wh.unregister_sms_callback(d["rental_id"])  # liberer manuel
     try:
         await sms_client.cancel_number(d["rental_id"])
         text = (
@@ -1156,6 +1217,7 @@ async def handle_renouveler(query, uid, context):
     country      = d.get("country", COUNTRY_FR)
     clear_number_timer(uid)
     add_history(uid, d["user_name"], d["number"], d["rental_id"], d["price"], d["operator"], country, "libere")
+    wh.unregister_sms_callback(d["rental_id"])  # renouvellement
     try: await sms_client.cancel_number(d["rental_id"])
     except Exception as e: logger.warning(f"Annulation renouvellement: {e}")
 
@@ -1733,20 +1795,170 @@ async def cmd_agents(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += f"{rank}. {icon} {b(esc(u['first_name']))} — {b(str(u['total_achats']))} achat(s)\n"
     await update.message.reply_text(text, parse_mode="HTML")
 
+# ─── Menu Système ─────────────────────────────────────────────────────────────
+async def handle_admin_systeme(query, uid):
+    from herosms_api import PROXIES
+    nb_proxies  = len(PROXIES)
+    proxy_label = f"{nb_proxies} proxy(s) charge(s)" if nb_proxies else "Aucun proxy configure"
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f504 Recharger les proxies",  callback_data="sys_reload_proxy"),
+         InlineKeyboardButton("\U0001f310 Tester la connexion",    callback_data="sys_test_conn")],
+        [InlineKeyboardButton("\U0001f501 Redemarrer le bot",      callback_data="sys_restart_confirm")],
+        [InlineKeyboardButton("\U0001f519 Menu principal",          callback_data="menu")],
+    ])
+    pending_wh = len(wh.get_pending_rentals())
+    wh_label   = f"{pending_wh} numero(s) en ecoute" if pending_wh else "aucun numero actif"
+    txt = "\u2699\ufe0f <b>Systeme &amp; Outils</b>\n\n" \
+          "\U0001f310 <b>Proxies :</b> " + proxy_label + "\n" \
+          "\U0001f4e1 <b>Webhook SMS :</b> " + wh_label + "\n" \
+          "\U0001f916 <b>Bot :</b> operationnel\n\n" \
+          "Choisissez une action :"
+    await query.edit_message_text(txt, parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_sys_reload_proxy(query, uid):
+    import herosms_api as _api
+    _api.PROXIES = _api._load_proxies()
+    nb = len(_api.PROXIES)
+    if nb:
+        label = f"\u2705 {nb} proxy(s) recharge(s)"
+    else:
+        label = "\u26a0\ufe0f Aucun proxy trouve (verifiez ROTATING_PROXY ou PROXY_LIST)"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("\U0001f519 Retour Systeme", callback_data="admin_systeme")]])
+    await query.edit_message_text("\U0001f504 <b>Rotation IP</b>\n\n" + label, parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_sys_test_conn(query, uid):
+    import aiohttp
+    from herosms_api import _pick_proxy
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\U0001f504 Retester",       callback_data="sys_test_conn"),
+         InlineKeyboardButton("\U0001f519 Retour Systeme", callback_data="admin_systeme")],
+    ])
+    await query.edit_message_text("\U0001f310 Test en cours...", parse_mode="HTML")
+    try:
+        proxy = _pick_proxy()
+        async with aiohttp.ClientSession() as s:
+            async with s.get("https://api.ipify.org?format=json",
+                             proxy=proxy, timeout=aiohttp.ClientTimeout(total=8)) as r:
+                data = await r.json()
+                ip_out = data.get("ip", "?")
+        mode = "via proxy" if proxy else "sans proxy (IP Railway fixe)"
+        txt = "\u2705 <b>Connexion OK</b>\n\n" \
+              "\U0001f310 IP sortante : <code>" + ip_out + "</code>\n" \
+              "\U0001f4e1 Mode : " + mode
+        await query.edit_message_text(txt, parse_mode="HTML", reply_markup=kb)
+    except Exception as e:
+        await query.edit_message_text(
+            "\u274c <b>Echec connexion</b>\n\n<code>" + str(e)[:200] + "</code>",
+            parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_sys_restart_confirm(query, uid):
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("\u2705 Confirmer le redemarrage", callback_data="sys_restart_do")],
+        [InlineKeyboardButton("\u274c Annuler",                  callback_data="admin_systeme")],
+    ])
+    txt = "\u26a0\ufe0f <b>Redemarrer le bot ?</b>\n\n" \
+          "Le bot sera indisponible quelques secondes.\n" \
+          "Les numeros actifs restent en base."
+    await query.edit_message_text(txt, parse_mode="HTML", reply_markup=kb)
+
+
+async def handle_sys_restart_do(query, uid, context):
+    await query.edit_message_text(
+        "\U0001f501 <b>Redemarrage en cours...</b>\n\nLe bot revient dans quelques secondes.",
+        parse_mode="HTML")
+    if not is_main_admin(uid):
+        try:
+            name = query.from_user.first_name
+            await context.bot.send_message(
+                chat_id=Config.ADMIN_ID,
+                text="\U0001f501 <b>Redemarrage declenche</b> par <b>" + esc(name) + "</b> (sous-admin).",
+                parse_mode="HTML")
+        except:
+            pass
+    await asyncio.sleep(1)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+# ─── Commandes texte /restart et /rotateip ───────────────────────────────────
+async def cmd_restart(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("\u26d4 Reserve aux admins.")
+        return
+    await update.message.reply_text("\U0001f501 <b>Redemarrage en cours...</b>", parse_mode="HTML")
+    if not is_main_admin(uid):
+        try:
+            name = esc(update.effective_user.first_name)
+            await context.bot.send_message(
+                chat_id=Config.ADMIN_ID,
+                text="\U0001f501 <b>Redemarrage declenche</b> par <b>" + name + "</b> (sous-admin).",
+                parse_mode="HTML")
+        except:
+            pass
+    await asyncio.sleep(1)
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+async def cmd_rotateip(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not is_admin(uid):
+        await update.message.reply_text("\u26d4 Reserve aux admins.")
+        return
+    import herosms_api as _api
+    _api.PROXIES = _api._load_proxies()
+    nb = len(_api.PROXIES)
+    if nb:
+        label = f"\u2705 {nb} proxy(s) recharge(s)"
+    else:
+        label = "\u26a0\ufe0f Aucun proxy configure (ROTATING_PROXY ou PROXY_LIST manquant)"
+    await update.message.reply_text("\U0001f310 <b>Rotation IP</b>\n\n" + label, parse_mode="HTML")
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
-def main():
+async def run():
+    """Point d'entrée async : démarre d'abord le serveur HTTP, puis le bot."""
+    # 1. Démarrer le serveur HTTP webhook EN PREMIER
+    #    Railway health-check valide le port avant d'accepter le déploiement
+    runner = await wh.start_webhook_server()
+
+    # 2. Construire l'application Telegram
     app = Application.builder().token(Config.BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",  start))
-    app.add_handler(CommandHandler("veille", cmd_veille))
-    app.add_handler(CommandHandler("agents", cmd_agents))
+    app.add_handler(CommandHandler("start",   start))
+    app.add_handler(CommandHandler("veille",  cmd_veille))
+    app.add_handler(CommandHandler("agents",  cmd_agents))
+    app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("rotateip",cmd_rotateip))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    async def post_init(application):
-        asyncio.create_task(price_watcher(application))
+    wh.set_bot_app(app)
 
-    app.post_init = post_init
+    # 3. Initialiser et démarrer le bot (polling)
+    await app.initialize()
+    await app.start()
+    asyncio.create_task(price_watcher(app))
     logger.info("🤖 Bot principal démarré — 🇫🇷 France & 🇺🇸 USA | Suivi prix actif")
-    app.run_polling(drop_pending_updates=True)
+
+    # 4. Boucle de polling (bloquante jusqu'à arrêt)
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    # Attendre indéfiniment
+    try:
+        await asyncio.Event().wait()
+    except (KeyboardInterrupt, SystemExit):
+        pass
+    finally:
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
+
+
+def main():
+    asyncio.run(run())
+
 
 if __name__ == "__main__":
     main()
