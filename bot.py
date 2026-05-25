@@ -1919,8 +1919,6 @@ async def cmd_rotateip(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    import signal
-
     async def run():
         # 1. Démarrer le serveur HTTP EN PREMIER (Railway health-check)
         runner = await wh.start_webhook_server()
@@ -1936,24 +1934,40 @@ def main():
 
         wh.set_bot_app(app)
 
-        # 3. post_init : lancer le price_watcher une fois le bot prêt
-        async def post_init(application):
-            asyncio.create_task(price_watcher(application))
-
-        app.post_init = post_init
-
         logger.info("🤖 Bot principal démarré — 🇫🇷 France & 🇺🇸 USA | Suivi prix actif")
 
-        # 4. run_polling gère initialize/start/stop/shutdown proprement
-        #    allowed_updates=[] = tous les updates
-        try:
-            await app.run_polling(
-                drop_pending_updates=True,
-                close_loop=False,
-            )
-        finally:
-            await runner.cleanup()
+        # 3. Initialiser manuellement
+        await app.initialize()
+        await app.start()
 
+        # 4. Lancer price_watcher
+        asyncio.create_task(price_watcher(app))
+
+        # 5. Démarrer le polling
+        await app.updater.start_polling(drop_pending_updates=True)
+
+        # 6. Attendre jusqu'à signal d'arrêt
+        stop_event = asyncio.Event()
+
+        def _signal_handler():
+            stop_event.set()
+
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except NotImplementedError:
+                pass
+
+        await stop_event.wait()
+
+        # 7. Arrêt propre
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
+        await runner.cleanup()
+
+    import signal
     asyncio.run(run())
 
 
