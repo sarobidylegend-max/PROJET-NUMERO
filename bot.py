@@ -46,6 +46,9 @@ bot_state = {
     "refresh_tasks":     {},   # {uid: asyncio.Task} — tâche de rafraîchissement auto du panneau
     "panel_message_ids": {},   # {uid: message_id} — message du panneau actif pour édition auto
     "panel_chat_ids":    {},   # {uid: chat_id}
+    # File d'attente IA — {uid: {user_name, country, chat_id, context, queued_at}}
+    "waiting_queue":     {},
+    "queue_tasks":       {},   # {uid: asyncio.Task} — tâche de file d'attente par agent
 }
 
 # ─── Helpers HTML ─────────────────────────────────────────────────────────────
@@ -438,13 +441,18 @@ def build_main_keyboard(uid):
     if is_main_admin(uid):
         label_veille = "☀️ Désactiver veille" if bot_state["veille"] else "🌙 Activer veille"
         buttons.append([InlineKeyboardButton(label_veille, callback_data="toggle_veille")])
+        nb_queue = len(bot_state["waiting_queue"])
+        queue_lbl = f"📋 File attente ({nb_queue})" if nb_queue > 0 else "📋 Demandes numéros"
         buttons.append([
-            InlineKeyboardButton("📋 Demandes numéros",      callback_data="admin_pending"),
+            InlineKeyboardButton(queue_lbl,                  callback_data="admin_pending"),
             InlineKeyboardButton("📊 Historique global",     callback_data="admin_historique"),
         ])
         buttons.append([
-            InlineKeyboardButton("👥 Agents & Stats",        callback_data="admin_agents"),
+            InlineKeyboardButton("⏳ File d'attente",        callback_data="admin_queue"),
             InlineKeyboardButton("💲 Suivi des prix",        callback_data="admin_prix"),
+        ])
+        buttons.append([
+            InlineKeyboardButton("👥 Agents & Stats",        callback_data="admin_agents"),
         ])
         buttons.append([
             InlineKeyboardButton("🛡️ Gérer les admins",     callback_data="admin_admins"),
@@ -544,6 +552,19 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "admin_prix"       and is_main_admin(uid):  await handle_admin_prix(query)
     elif data == "admin_admins"     and is_main_admin(uid):  await handle_admin_admins(query)
     elif data == "admin_recharge"   and is_main_admin(uid):  await handle_admin_recharge(query)
+    elif data == "admin_queue"      and is_admin(uid):       await handle_admin_queue(query)
+    elif data == "cancel_queue":
+        if uid in bot_state["waiting_queue"]:
+            task = bot_state["queue_tasks"].pop(uid, None)
+            if task and not task.done(): task.cancel()
+            bot_state["waiting_queue"].pop(uid, None)
+            await query.edit_message_text(
+                f"✅ {b('Demande annulée')}\n\nVous avez quitté la file d\'attente.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu")]]))
+        else:
+            await query.edit_message_text("⚠️ Vous n\'étiez pas en file d\'attente.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu")]]))
 
     # ── Système & Outils (admin + sous-admin) ──
     elif data == "admin_systeme"          and is_admin(uid): await handle_admin_systeme(query, uid)
@@ -655,107 +676,368 @@ async def handle_solde(query):
     await handle_capacite(query)
 
 # ─── Helper central : obtenir un numéro au meilleur prix + enregistrer webhook ──
-MAX_AUTO_PRICE = 0.10  # Seuil global : jamais plus de 0.10 $ par numéro
+MAX_AUTO_PRICE       = 0.09  # Plafond : prend 0.085 $ mais jamais 0.30 $ ni 1 $
+AI_MAX_RETRIES       = 3     # Tentatives IA avant mise en file d'attente
+QUEUE_RETRY_INTERVAL = 30   # Secondes entre chaque retry en file d'attente
+QUEUE_MAX_WAIT_SEC   = 300  # Temps max en file d'attente (5 minutes)
+
+
+def _make_sms_callback(uid, context):
+    """Crée le callback webhook OTP pour un agent (closure propre)."""
+    async def _on_sms(sms_payload, _uid=uid, _app=context.application):
+        if _uid not in bot_state["active_numbers"]:
+            return
+        d2 = bot_state["active_numbers"][_uid]
+        d2["webhook_sms"] = sms_payload
+        sms_code = sms_payload.get("code", "?")
+        sms_msg  = sms_payload.get("message", sms_code)
+        # Stocker le code OTP dans l'historique pour l'admin
+        for e in bot_state["history"]:
+            if e["rental_id"] == d2.get("rental_id"):
+                e["otp_code"] = str(sms_code)
+                e["otp_msg"]  = str(sms_msg)
+                break
+        notif = (
+            "\U0001f514 " + b("Code OTP recu en temps reel !") + "\n\n"
+            "\U0001f511 Code : " + code(esc(str(sms_code))) + "\n"
+            "\U0001f4e8 " + i(esc(str(sms_msg)))
+        )
+        try:
+            await _app.bot.send_message(chat_id=_uid, text=notif, parse_mode="HTML")
+        except Exception as exc:
+            logger.warning(f"[Webhook] notif uid={_uid}: {exc}")
+        # Mettre à jour le panneau inline si on a les identifiants
+        msg_id  = bot_state["panel_message_ids"].get(_uid)
+        chat_id = bot_state["panel_chat_ids"].get(_uid)
+        if msg_id and chat_id:
+            rows = [
+                [InlineKeyboardButton("\U0001f504 Rafraichir",   callback_data="voir_otp"),
+                 InlineKeyboardButton("\U0001f4e9 Nouveau code", callback_data="nouveau_code")],
+                [InlineKeyboardButton("\U0001f501 Changer numero",  callback_data="renouveler_numero")],
+                [InlineKeyboardButton("\U0001f51a Liberer le numero", callback_data="liberer_numero")],
+                [InlineKeyboardButton("\U0001f519 Menu", callback_data="menu")],
+            ]
+            try:
+                await _app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=msg_id,
+                    text=notif + "\n\n" + i("Panneau mis a jour automatiquement."),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup(rows))
+            except Exception:
+                pass
+    return _on_sms
+
 
 async def _auto_get_number(country: str, uid: int, user_name: str, context) -> dict | None:
     """
-    Obtient automatiquement le numéro le moins cher disponible à MAX_AUTO_PRICE ou moins.
-    - Rafraîchit les prix en temps réel
-    - Filtre <= MAX_AUTO_PRICE (inclut exactement 0.10 $)
-    - Tente du moins cher au plus cher jusqu'à succès
-    - Si tous les opérateurs échouent, tente avec operator='any' en dernier recours
+    Obtient automatiquement le numéro le moins cher via sélection IA (Claude AI).
+    - L'IA analyse les prix et choisit l'ordre optimal des opérateurs
+    - Retry intelligent : chaque tentative échouée est transmise à l'IA
+    - Prend le prix le plus bas disponible (aucun plafond fixe)
     - Enregistre le callback webhook HeroSMS automatiquement
-    - Retourne le dict complet {number, rental_id, price, operator, country}
-      ou lève une Exception avec un message lisible si aucun numéro disponible.
+    - Retourne {number, rental_id, price, operator, country}
+      ou lève une Exception si aucun numéro disponible après tous les essais.
     """
-    prices = await get_prices_cached(country, force=True)
-    eligible = [p for p in prices if p["price"] <= MAX_AUTO_PRICE]
-
-    if not eligible:
-        # Dernier recours : tenter avec operator='any' sans filtrage prix
-        eligible = [{"operator": "any", "price": MAX_AUTO_PRICE, "count": 1}]
-
+    prices  = await get_prices_cached(country, force=True)
     balance = await sms_client.get_balance()
-    tried   = []
+    c_label = country_label(country)
+    failed  = []   # opérateurs échoués dans cette session
 
-    for candidate in eligible:
-        price_try = candidate["price"]
-        op_try    = candidate.get("operator", "any")
+    if balance <= 0:
+        raise Exception("solde insuffisant")
 
-        if balance < price_try:
-            tried.append(f"{op_try}@{price_try:.4f}$ (solde insuf.)")
-            continue
+    # Filtrer uniquement les offres <= MAX_AUTO_PRICE (ex: 0.085 $ oui, 0.30 $ non, 1 $ non)
+    eligible_prices = [p for p in prices if p.get("price", 999) <= MAX_AUTO_PRICE]
+    if not eligible_prices:
+        raise Exception(
+            f"Aucune offre à {MAX_AUTO_PRICE:.2f} $ ou moins. "
+            f"Prix minimum disponible : {min(p['price'] for p in prices):.4f} $"
+        )
 
-        try:
-            result    = await sms_client.get_number(Config.SERVICE, country, op_try)
-            number    = result["number"]
-            rental_id = result["id"]
+    for attempt in range(1, AI_MAX_RETRIES + 1):
+        # ── L'IA choisit la meilleure stratégie parmi les offres éligibles ───
+        candidates = await ai_select_best_operators(
+            prices           = eligible_prices,
+            country_label    = c_label,
+            service          = Config.SERVICE,
+            balance          = balance,
+            failed_operators = failed,
+            attempt          = attempt,
+        )
 
-            # ── Webhook callback : notifie l'agent dès réception du SMS ──────
-            async def _on_sms(sms_payload, _uid=uid, _app=context.application):
-                if _uid not in bot_state["active_numbers"]:
-                    return
-                d2 = bot_state["active_numbers"][_uid]
-                d2["webhook_sms"] = sms_payload
-                sms_code = sms_payload.get("code", "?")
-                sms_msg  = sms_payload.get("message", sms_code)
-                # Stocker le code dans l'historique pour l'admin
-                for e in bot_state["history"]:
-                    if e["rental_id"] == d2.get("rental_id"):
-                        e["otp_code"] = str(sms_code)
-                        e["otp_msg"]  = str(sms_msg)
-                        break
-                notif = (
-                    "\U0001f514 " + b("Code OTP recu en temps reel !") + "\n\n"
-                    "\U0001f511 Code : " + code(esc(str(sms_code))) + "\n"
-                    "\U0001f4e8 " + i(esc(str(sms_msg)))
+        if not candidates:
+            logger.warning(f"[AI] Aucun candidat retourné (tentative {attempt})")
+            break
+
+        for candidate in candidates:
+            price_try = candidate["price"]
+            op_try    = candidate.get("operator", "any")
+
+            if balance < price_try:
+                logger.warning(f"[AI] Solde insuffisant pour {op_try}@{price_try:.4f}$")
+                failed.append(op_try)
+                continue
+
+            try:
+                result    = await sms_client.get_number(Config.SERVICE, country, op_try)
+                number    = result["number"]
+                rental_id = result["id"]
+
+                # Enregistrer le callback OTP via la closure propre
+                wh.register_sms_callback(rental_id, _make_sms_callback(uid, context))
+
+                logger.info(
+                    f"[AI-AutoSelect] ✅ uid={uid} op={op_try} "
+                    f"prix={price_try:.4f}$ rental={rental_id} tentative={attempt}"
                 )
+                return {
+                    "number":    number,
+                    "rental_id": rental_id,
+                    "price":     price_try,
+                    "operator":  op_try,
+                    "country":   country,
+                }
+
+            except Exception as err:
+                failed.append(op_try)
+                logger.warning(
+                    f"[AI-AutoSelect] Tentative {attempt} op={op_try} "
+                    f"prix={price_try:.4f}$ → {err}"
+                )
+
+        # Pause inter-tentative pour laisser le stock se reconstituer
+        if attempt < AI_MAX_RETRIES:
+            await asyncio.sleep(2)
+
+    raise Exception(
+        f"Aucun numéro disponible après {AI_MAX_RETRIES} tentatives IA "
+        f"(essayés: {', '.join(set(failed)) or 'aucun'})"
+    )
+
+
+# ─── File d'attente intelligente ────────────────────────────────────────────────
+async def _enqueue_number_request(query, uid: int, user_name: str, country: str, flag: str, context):
+    """
+    Met la demande de l'agent en file d'attente et notifie l'admin.
+    Relance automatiquement _auto_get_number toutes les QUEUE_RETRY_INTERVAL secondes.
+    """
+    if uid in bot_state["waiting_queue"]:
+        await query.edit_message_text(
+            f"⏳ {b('Déjà en file d\'attente')}\n\n"
+            f"Vous êtes déjà en attente d'un numéro {flag}.\n"
+            f"Vous serez notifié automatiquement dès qu'un numéro est disponible.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Annuler l'attente", callback_data="cancel_queue"),
+                InlineKeyboardButton("🔙 Menu", callback_data="menu"),
+            ]]))
+        return
+
+    # Enregistrer dans la file
+    bot_state["waiting_queue"][uid] = {
+        "user_name":  user_name,
+        "country":    country,
+        "chat_id":    query.message.chat_id,
+        "queued_at":  now(),
+        "context":    context,
+        "attempts":   0,
+    }
+
+    # Notifier l'agent
+    await query.edit_message_text(
+        f"⏳ {b('En file d\'attente')}\n\n"
+        f"Aucun numéro {flag} disponible actuellement.\n"
+        f"Le bot va {b('réessayer automatiquement')} toutes les {QUEUE_RETRY_INTERVAL}s pendant {QUEUE_MAX_WAIT_SEC // 60} minutes.\n\n"
+        f"📢 {i('Vous serez notifié dès qu\'un numéro est obtenu.')}",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Annuler l'attente", callback_data="cancel_queue"),
+            InlineKeyboardButton("🔙 Menu", callback_data="menu"),
+        ]]))
+
+    # Notifier l'admin
+    nb_queue = len(bot_state["waiting_queue"])
+    try:
+        await context.bot.send_message(
+            chat_id=Config.ADMIN_ID,
+            text=(
+                f"📋 {b('Nouvelle demande en file d\'attente')}\n\n"
+                f"👤 {b(esc(user_name))} attend un numéro {flag}\n"
+                f"🕐 {now()}\n"
+                f"📊 File d'attente : {b(str(nb_queue))} agent(s) en attente\n\n"
+                f"{i('Le bot réessaie automatiquement toutes les 30s.')}"
+            ),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📋 Voir file d'attente", callback_data="admin_queue"),
+            ]]))
+    except: pass
+
+    # Lancer la tâche de fond de retry
+    task = asyncio.create_task(_queue_retry_task(uid, context))
+    bot_state["queue_tasks"][uid] = task
+
+
+async def _queue_retry_task(uid: int, context):
+    """
+    Tâche de fond : réessaie d'obtenir un numéro toutes les QUEUE_RETRY_INTERVAL secondes.
+    S'arrête après QUEUE_MAX_WAIT_SEC ou si le numéro est obtenu.
+    """
+    start_time = datetime.now()
+    attempt    = 0
+
+    try:
+        while uid in bot_state["waiting_queue"]:
+            elapsed = (datetime.now() - start_time).total_seconds()
+            if elapsed >= QUEUE_MAX_WAIT_SEC:
+                # Timeout — retirer de la file et notifier
+                qdata = bot_state["waiting_queue"].pop(uid, {})
+                bot_state["queue_tasks"].pop(uid, None)
                 try:
-                    await _app.bot.send_message(chat_id=_uid, text=notif, parse_mode="HTML")
-                except Exception as exc:
-                    logger.warning(f"[Webhook] notif uid={_uid}: {exc}")
-                # Mettre à jour le panneau inline si on a les identifiants
-                msg_id  = bot_state["panel_message_ids"].get(_uid)
-                chat_id = bot_state["panel_chat_ids"].get(_uid)
-                if msg_id and chat_id:
-                    rows = [
-                        [InlineKeyboardButton("\U0001f504 Rafraichir",   callback_data="voir_otp"),
-                         InlineKeyboardButton("\U0001f4e9 Nouveau code", callback_data="nouveau_code")],
-                        [InlineKeyboardButton("\U0001f501 Changer numero",  callback_data="renouveler_numero")],
-                        [InlineKeyboardButton("\U0001f51a Liberer le numero", callback_data="liberer_numero")],
-                        [InlineKeyboardButton("\U0001f519 Menu", callback_data="menu")],
-                    ]
-                    try:
-                        await _app.bot.edit_message_text(
-                            chat_id=chat_id, message_id=msg_id,
-                            text=notif + "\n\n" + i("Panneau mis a jour automatiquement."),
-                            parse_mode="HTML",
-                            reply_markup=InlineKeyboardMarkup(rows))
-                    except Exception:
-                        pass
+                    await context.bot.send_message(
+                        chat_id=qdata.get("chat_id", uid),
+                        text=(
+                            f"⌛ {b('File d\'attente expirée')}\n\n"
+                            f"Aucun numéro disponible après {QUEUE_MAX_WAIT_SEC // 60} minutes.\n"
+                            f"Veuillez réessayer manuellement plus tard."
+                        ),
+                        parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("🔄 Réessayer", callback_data="choisir_prix"),
+                            InlineKeyboardButton("🔙 Menu",      callback_data="menu"),
+                        ]]))
+                    # Notifier l'admin aussi
+                    qname = esc(qdata.get("user_name", "?"))
+                    flag  = country_flag(qdata.get("country", COUNTRY_FR))
+                    await context.bot.send_message(
+                        chat_id=Config.ADMIN_ID,
+                        text=(
+                            f"⌛ {b('File expirée')} — {b(qname)} {flag}\n"
+                            f"Aucun numéro trouvé après {QUEUE_MAX_WAIT_SEC // 60} min.\n"
+                            f"File restante : {b(str(len(bot_state['waiting_queue'])))} agent(s)"
+                        ),
+                        parse_mode="HTML")
+                except: pass
+                return
 
-            wh.register_sms_callback(rental_id, _on_sms)
+            await asyncio.sleep(QUEUE_RETRY_INTERVAL)
+            attempt += 1
 
-            logger.info(f"[AutoSelect] ✅ uid={uid} op={op_try} prix={price_try:.4f}$ rental={rental_id}")
-            return {
-                "number":    number,
-                "rental_id": rental_id,
-                "price":     price_try,
-                "operator":  op_try,
-                "country":   country,
+            if uid not in bot_state["waiting_queue"]:
+                return  # Annulé entre-temps
+
+            qdata   = bot_state["waiting_queue"][uid]
+            country = qdata["country"]
+            flag    = country_flag(country)
+            user_name = qdata["user_name"]
+            qdata["attempts"] = attempt
+
+            try:
+                r = await _auto_get_number(country, uid, user_name, context)
+            except Exception:
+                # Pas encore disponible — continuer à attendre
+                continue
+
+            # ✅ Numéro obtenu ! Sortir de la file et attribuer
+            bot_state["waiting_queue"].pop(uid, None)
+            bot_state["queue_tasks"].pop(uid, None)
+
+            if uid in bot_state["active_numbers"]:
+                # L'agent a déjà un numéro (obtenu autrement) — annuler
+                try: await sms_client.cancel_number(r["rental_id"])
+                except: pass
+                return
+
+            number    = r["number"]
+            rental_id = r["rental_id"]
+            price     = r["price"]
+            operator  = r["operator"]
+
+            d = {
+                "number": number, "rental_id": rental_id, "user_name": user_name,
+                "price": price, "operator": operator, "country": country,
+                "accepted_at": now(), "requested_at": now(),
             }
+            bot_state["active_numbers"][uid] = d
+            add_history(uid, user_name, number, rental_id, price, operator, country, "accepte")
+            um.increment_achats(uid, number)
+            start_number_timer(uid)
+            task = asyncio.create_task(number_expiry_task(uid, context.application))
+            bot_state["timer_tasks"][uid] = task
 
-        except Exception as err:
-            err_str = str(err)
-            tried.append(f"{op_try}@{price_try:.4f}$ ({err_str[:30]})")
-            logger.warning(f"[AutoSelect] op={op_try} prix={price_try} → {err_str}")
+            remaining = len(bot_state["waiting_queue"])
 
-    raise Exception(f"Aucun numéro disponible (essais: {', '.join(tried)})")
+            # Notifier l'agent
+            try:
+                await context.bot.send_message(
+                    chat_id=qdata["chat_id"],
+                    text=(
+                        f"🎉 {b('Numéro obtenu !')}\n\n"
+                        f"{flag} {b(format_number(number, country))}\n"
+                        f"💲 {b(f'{price:.4f}')} $ — {code(esc(operator))}\n"
+                        f"⏱ Obtenu après {attempt} tentative(s) en file.\n\n"
+                        f"📋 Ouvrez le menu pour voir votre panneau OTP."
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🟢 Voir mon numéro", callback_data="voir_otp"),
+                    ]]))
+            except: pass
+
+            # Notifier l'admin
+            try:
+                await context.bot.send_message(
+                    chat_id=Config.ADMIN_ID,
+                    text=(
+                        f"✅ {b('File d\'attente — numéro attribué')}\n\n"
+                        f"👤 {b(esc(user_name))}\n"
+                        f"{flag} {code(format_number(number, country))}\n"
+                        f"💲 {b(f'{price:.4f}')} $ — tentative {attempt}\n"
+                        f"📊 File restante : {b(str(remaining))} agent(s)\n"
+                        f"🕐 {now()}"
+                    ),
+                    parse_mode="HTML")
+            except: pass
+            return
+
+    except asyncio.CancelledError:
+        pass  # Annulé proprement
+
+
+async def handle_admin_queue(query):
+    """Affiche la file d'attente actuelle pour l'admin."""
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Actualiser", callback_data="admin_queue"),
+         InlineKeyboardButton("🔙 Retour",    callback_data="menu")],
+    ])
+    q = bot_state["waiting_queue"]
+    if not q:
+        await query.edit_message_text(
+            f"📋 {b('File d\'attente')}\n\n✅ Aucune demande en attente.",
+            parse_mode="HTML", reply_markup=kb)
+        return
+
+    text = f"📋 {b('File d\'attente')} — {b(str(len(q)))} agent(s)\n\n"
+    for uid, data in q.items():
+        flag = country_flag(data.get("country", COUNTRY_FR))
+        text += (
+            f"👤 {b(esc(data['user_name']))} {flag}\n"
+            f"   🕐 En attente depuis : {data.get('queued_at', '?')}\n"
+            f"   🔄 Tentatives : {data.get('attempts', 0)}\n\n"
+        )
+
+    buttons = [
+        [InlineKeyboardButton("🔄 Actualiser", callback_data="admin_queue"),
+         InlineKeyboardButton("🔙 Retour",    callback_data="menu")],
+    ]
+    await query.edit_message_text(text, parse_mode="HTML",
+                                  reply_markup=InlineKeyboardMarkup(buttons))
+
 
 
 # ─── Choisir parmi les prix ───────────────────────────────────────────────────
 async def handle_choisir_prix(query, uid, context=None):
-    """Sélection entièrement automatique : le bot choisit le prix le plus bas < 0.10 $ sans menu."""
+    """Sélection entièrement automatique : le bot choisit le prix le plus bas disponible."""
     await handle_demander_numero(query, uid, context, price_index=0)
 
 
@@ -794,18 +1076,28 @@ async def handle_demander_numero(query, uid, context, price_index: int = 0):
         r = await _auto_get_number(country, uid, user_name, context)
     except Exception as e:
         err_msg = str(e).lower()
-        # Message propre selon le type d'erreur — sans détails techniques
         if "solde" in err_msg or "balance" in err_msg or "insuf" in err_msg:
-            user_msg = "💳 Solde insuffisant sur le compte HeroSMS."
+            # Solde insuffisant — pas de file d'attente, notifier admin
+            await query.edit_message_text(
+                f"💳 {b('Solde insuffisant')}\n\nLe compte HeroSMS n'a plus assez de fonds.\nContactez l'administrateur.",
+                parse_mode="HTML", reply_markup=kb_back)
+            try:
+                await context.bot.send_message(
+                    chat_id=Config.ADMIN_ID,
+                    text=(
+                        f"⚠️ {b('Solde HeroSMS insuffisant !')}\n\n"
+                        f"👤 {b(esc(user_name))} a tenté d'obtenir un numéro {flag} mais le solde est insuffisant.\n"
+                        f"🕐 {now()}\n\n"
+                        f"💳 {i('Rechargez le compte HeroSMS pour débloquer les demandes.')}"
+                    ),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("💳 Recharger", callback_data="admin_recharge")
+                    ]]))
+            except: pass
         else:
-            user_msg = f"📵 Aucun numéro {flag} disponible pour le moment."
-        await query.edit_message_text(
-            f"❌ {b('Numéro indisponible')}\n\n{user_msg}\n\n💡 Réessayez dans quelques instants ou changez de pays.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔄 Réessayer", callback_data="choisir_prix")],
-                [InlineKeyboardButton("🔙 Menu",      callback_data="menu")],
-            ]))
+            # Aucun numéro disponible — mise en file d'attente automatique
+            await _enqueue_number_request(query, uid, user_name, country, flag, context)
         return
 
     number    = r["number"]

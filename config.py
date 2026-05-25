@@ -33,3 +33,8 @@ class Config:
         "HEROSMS_RECHARGE_URL",
         "https://hero-sms.com/balance/add"
     )
+
+    # ── Claude AI (sélection intelligente des numéros) ─────────────────────────
+    # Obtenir une clé sur : https://console.anthropic.com
+    # Définir la variable d'environnement ANTHROPIC_API_KEY sur Railway/votre serveur
+    ANTHROPIC_API_KEY: str = os.getenv("ANTHROPIC_API_KEY", "")
